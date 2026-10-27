@@ -1,0 +1,98 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Root level default deny rule
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Global authorization helper functions
+    function isSignedIn() { return request.auth != null; }
+    function isOwner(userId) { return isSignedIn() && request.auth.uid == userId; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isValidId(id) { return id is string && id.size() <= 64 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+
+    // 3. Document validation schemas
+    function isValidAppointment(data) {
+      return data.keys().hasAll(['doctorName', 'specialty', 'date', 'status'])
+             && data.keys().size() <= 12
+             && data.doctorName is string && data.doctorName.size() <= 100
+             && data.specialty is string && data.specialty.size() <= 100
+             && data.status in ['confirmed', 'pending', 'cancelled', 'upcoming', 'completed'];
+    }
+
+    function isValidThresholds(data) {
+      return data.keys().hasAll(['good', 'warn', 'bad'])
+             && data.keys().size() <= 15
+             && data.good is number && data.warn is number && data.bad is number
+             && data.good > data.warn && data.warn > data.bad;
+    }
+
+    function isValidSession(data) {
+      return data.keys().hasAll(['date', 'startTime', 'endTime', 'duration', 'score', 'slouches'])
+             && data.keys().size() <= 20
+             && data.duration is number && data.duration >= 0
+             && data.score is number && data.score >= 0 && data.score <= 100
+             && data.slouches is number && data.slouches >= 0;
+    }
+
+    function isValidBreak(data) {
+      return data.keys().hasAll(['timestamp', 'preBreakFatigue', 'postBreakResilience', 'thoracicStressRelief', 'durationSeconds'])
+             && data.keys().size() <= 10
+             && data.timestamp is string && data.timestamp.size() <= 50
+             && data.preBreakFatigue is number && data.preBreakFatigue >= 0
+             && data.postBreakResilience is number && data.postBreakResilience >= 0 && data.postBreakResilience <= 100
+             && data.thoracicStressRelief is number && data.thoracicStressRelief >= 0 && data.thoracicStressRelief <= 100
+             && data.durationSeconds is number && data.durationSeconds >= 0;
+    }
+
+    // 4. Secure Resource Endpoints
+    match /users/{userId} {
+      allow read: if isSignedIn() && (isOwner(userId) || (resource != null && resource.data.email == request.auth.token.email));
+      allow write: if isOwner(userId);
+
+      // User calibration and alarm thresholds settings
+      match /settings/thresholds {
+        allow read: if isOwner(userId);
+        allow write: if isOwner(userId) && isValidThresholds(incoming());
+      }
+
+      // Clinical orthopedic appointment logs
+      match /appointments/{appointmentId} {
+        allow list: if isOwner(userId);
+        allow get: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidId(appointmentId) && isValidAppointment(incoming());
+        allow update: if isOwner(userId) 
+                      && isValidId(appointmentId)
+                      && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'date', 'time', '_deleted']);
+        allow delete: if isOwner(userId);
+      }
+
+      // Biometric sitting diagnostic logs (immutable archives)
+      match /sessions/{sessionId} {
+        allow list: if isOwner(userId);
+        allow get: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidId(sessionId) && isValidSession(incoming());
+        allow update: if isOwner(userId) && isValidSession(incoming());
+        allow delete: if isOwner(userId); // Enabled for account teardown & GDPR sovereignty
+      }
+
+      // Paraspinal decompression/break history
+      match /breaks/{breakId} {
+        allow list: if isOwner(userId);
+        allow get: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(breakId) && isValidBreak(incoming());
+        allow delete: if isOwner(userId);
+      }
+    }
+
+    match /devices/{userId} {
+      allow read, write: if isOwner(userId);
+    }
+
+    match /test/{docId} {
+      allow read: if isSignedIn();
+    }
+  }
+}

@@ -1,0 +1,601 @@
+import { store, updateAngle, updateBattery, setDeviceStatus, setHasPaired, setIsRecordingSession, setIsSimulating, updateVitals } from '../store/store';
+import { vitalsService } from './vitalsService';
+import { ImuTelemetryFilter } from './biomechanicsEngine';
+import { fallDetectionService } from './fallDetectionService';
+import { Capacitor } from '@capacitor/core';
+import { BleClient } from '@capacitor-community/bluetooth-le';
+
+// BLE GATT Profile Constants - Aligned with PosturePal ESP32 firmware
+export const POSTURE_SERVICE_UUID = '00001830-0000-1000-8000-00805f9b34fb';
+export const CHARACTERISTIC_ANGLE_UUID = '00002a5a-0000-1000-8000-00805f9b34fb';
+export const CHARACTERISTIC_BATT_UUID = '00002a19-0000-1000-8000-00805f9b34fb';
+export const CHARACTERISTIC_CONFIG_UUID = '00002a5c-0000-1000-8000-00805f9b34fb';
+export const CHARACTERISTIC_VITALS_UUID = '00002a5e-0000-1000-8000-00805f9b34fb';
+export const HEART_RATE_SERVICE_UUID = '0000180d-0000-1000-8000-00805f9b34fb';
+export const CHARACTERISTIC_HR_UUID = '00002a37-0000-1000-8000-00805f9b34fb';
+
+class BluetoothService {
+  private device: any = null;
+  private server: any = null;
+  private angleCharacteristic: any = null;
+  private batteryCharacteristic: any = null;
+  private configCharacteristic: any = null;
+  private reconnectTimeout: any = null;
+  private isConnecting: boolean = false;
+  private isNative: boolean = Capacitor.isNativePlatform();
+  private nativeDeviceId: string | null = null;
+  private isBleClientInitialized: boolean = false;
+
+  public isSupported(): boolean {
+    if (this.isNative) return true;
+    return typeof navigator !== 'undefined' && ('bluetooth' in navigator || (navigator as any).bluetooth !== undefined);
+  }
+
+  public isConnected(): boolean {
+    if (this.isNative) {
+      return store.getState().device.isConnected;
+    }
+    return !!(this.server && this.server.connected);
+  }
+
+  public getDeviceName(): string {
+    return this.device?.name || 'PosturePal Pod';
+  }
+
+  private async ensureNativeBleInitialized() {
+    if (this.isNative && !this.isBleClientInitialized) {
+      try {
+        await BleClient.initialize();
+        this.isBleClientInitialized = true;
+      } catch (err) {
+        console.warn('BleClient initialize error or already initialized:', err);
+      }
+    }
+  }
+
+  public async connect(): Promise<boolean> {
+    if (!this.isSupported()) {
+      console.warn('Bluetooth API is not supported in this environment.');
+      return false;
+    }
+
+    if (this.isConnecting) return false;
+    this.isConnecting = true;
+
+    // --- NATIVE CAPACITOR BLE HANDLER (ANDROID / IOS) ---
+    if (this.isNative) {
+      try {
+        await this.ensureNativeBleInitialized();
+        console.log('Native BLE: Requesting PosturePal device...');
+        const bleDevice = await BleClient.requestDevice({
+          services: [POSTURE_SERVICE_UUID],
+          optionalServices: [POSTURE_SERVICE_UUID, '0000180f-0000-1000-8000-00805f9b34fb']
+        });
+
+        this.nativeDeviceId = bleDevice.deviceId;
+        this.device = bleDevice;
+
+        await BleClient.connect(bleDevice.deviceId, (deviceId) => {
+          console.warn('Native BLE: Device disconnected:', deviceId);
+          this.handleDisconnected();
+        });
+
+        // Start angle notifications natively
+        await BleClient.startNotifications(
+          bleDevice.deviceId,
+          POSTURE_SERVICE_UUID,
+          CHARACTERISTIC_ANGLE_UUID,
+          (value) => {
+            const parsed = this.parseBleAngle(value);
+            if (parsed !== null && !isNaN(parsed)) {
+              const filtered = ImuTelemetryFilter.processSample(parsed);
+              store.dispatch(updateAngle(filtered));
+            }
+          }
+        );
+
+        // Start battery notifications natively
+        try {
+          await BleClient.startNotifications(
+            bleDevice.deviceId,
+            POSTURE_SERVICE_UUID,
+            CHARACTERISTIC_BATT_UUID,
+            (value) => {
+              const batt = this.parseBleBattery(value);
+              if (batt !== null) {
+                store.dispatch(updateBattery(batt));
+              }
+            }
+          );
+        } catch (battErr) {
+          console.warn('Native BLE: Battery notification not available:', battErr);
+        }
+
+        store.dispatch(setIsSimulating(false));
+        store.dispatch(setHasPaired(true));
+        store.dispatch(setDeviceStatus(true));
+        store.dispatch(updateVitals({ status: 'live' }));
+        this.isConnecting = false;
+        console.log('✅ Native Bluetooth Low Energy connected and listening!');
+        return true;
+      } catch (nativeErr) {
+        this.isConnecting = false;
+        console.error('Native BLE connection failed:', nativeErr);
+        throw nativeErr;
+      }
+    }
+
+    // --- WEB BLUETOOTH API HANDLER (DESKTOP & MOBILE BROWSERS) ---
+    try {
+      console.log('Requesting PosturePal Bluetooth device...');
+      const bluetooth = (navigator as any).bluetooth;
+      const device = await bluetooth.requestDevice({
+        filters: [
+          { namePrefix: 'PosturePal' },
+          { namePrefix: 'Posture' },
+          { namePrefix: 'ESP32' },
+          { services: [POSTURE_SERVICE_UUID] }
+        ],
+        optionalServices: [POSTURE_SERVICE_UUID, 'battery_service', 0x180f, 0x1830]
+      });
+
+      this.device = device;
+      device.addEventListener('gattserverdisconnected', this.handleDisconnected);
+
+      const success = await this.establishGattConnection();
+      this.isConnecting = false;
+      return success;
+    } catch (error: any) {
+      this.isConnecting = false;
+      const errMsg = String(error?.message || error);
+      if (errMsg.includes('permissions policy') || errMsg.includes('disallowed') || errMsg.includes('SecurityError') || errMsg.includes('User cancelled')) {
+        console.warn('BLE connection notice (sandbox policy or user bypass):', errMsg);
+      } else {
+        console.error('BLE connection request cancelled or failed:', error);
+      }
+      throw error;
+    }
+  }
+
+  private async establishGattConnection(): Promise<boolean> {
+    if (!this.device) return false;
+
+    try {
+      console.log('Connecting to GATT server...');
+      const server = await this.device.gatt?.connect();
+      if (!server) throw new Error('Could not connect to GATT server');
+      this.server = server;
+
+      console.log('Fetching Primary Service...');
+      const service = await server.getPrimaryService(POSTURE_SERVICE_UUID);
+
+      console.log('Fetching Angle/Pitch Characteristic...');
+      try {
+        const angleChar = await service.getCharacteristic(CHARACTERISTIC_ANGLE_UUID);
+        this.angleCharacteristic = angleChar;
+        // Attach listener BEFORE starting notifications to catch initial bursts
+        angleChar.addEventListener('characteristicvaluechanged', this.handleAngleNotification);
+        await angleChar.startNotifications();
+        console.log('✅ Angle characteristic notifications started.');
+
+        // Immediate initial read so app displays live angle without waiting for next motion/tick
+        try {
+          const initialAngleVal = await angleChar.readValue();
+          if (initialAngleVal) {
+            const parsed = this.parseBleAngle(initialAngleVal);
+            if (parsed !== null) {
+              store.dispatch(updateAngle(parsed));
+              console.log('📡 BLE Initial Pitch Angle Read:', parsed);
+            }
+          }
+        } catch (readErr) {
+          console.log('Initial angle read not supported or handled via notify:', readErr);
+        }
+      } catch (err) {
+        console.error('Failed to bind Angle Characteristic:', err);
+      }
+
+      console.log('Fetching Battery Characteristic...');
+      try {
+        const battChar = await service.getCharacteristic(CHARACTERISTIC_BATT_UUID);
+        this.batteryCharacteristic = battChar;
+        battChar.addEventListener('characteristicvaluechanged', this.handleBatteryNotification);
+        await battChar.startNotifications();
+        console.log('✅ Battery characteristic notifications started.');
+
+        // Immediate initial battery read
+        try {
+          const initialBattVal = await battChar.readValue();
+          if (initialBattVal) {
+            const parsedBatt = this.parseBleBattery(initialBattVal);
+            if (parsedBatt !== null) {
+              store.dispatch(updateBattery(parsedBatt));
+              console.log('📡 BLE Initial Battery Level Read:', parsedBatt);
+            }
+          }
+        } catch (readErr) {
+          console.log('Initial battery read not supported or handled via notify:', readErr);
+        }
+      } catch (err) {
+        console.error('Failed to bind Battery Characteristic:', err);
+      }
+
+      console.log('Fetching Config Characteristic...');
+      try {
+        const configChar = await service.getCharacteristic(CHARACTERISTIC_CONFIG_UUID);
+        this.configCharacteristic = configChar;
+        console.log('✅ Config characteristic bound.');
+      } catch (err) {
+        console.warn('Config characteristic not found or not writable:', err);
+      }
+
+      // Optional: Fetch Vitals characteristic if present in firmware
+      try {
+        const vitalsChar = await service.getCharacteristic(CHARACTERISTIC_VITALS_UUID);
+        await vitalsChar.startNotifications();
+        vitalsChar.addEventListener('characteristicvaluechanged', (e: any) => {
+          try {
+            const view = e.target.value;
+            const hr = view.getUint8(0);
+            const spo2 = view.getUint8(1);
+            if (hr > 30 && hr < 220) {
+              const currentAngle = store.getState().posture.angle;
+              vitalsService.logTelemetry({
+                heartRate: hr,
+                spo2: (spo2 >= 70 && spo2 <= 100) ? spo2 : 98,
+                status: 'live',
+                postureAngle: currentAngle,
+                deviceId: this.device?.id || 'ble-hardware-pod'
+              });
+            }
+          } catch (err) {
+            console.warn('Failed to parse vitals packet:', err);
+          }
+        });
+        console.log('✅ Vitals characteristic notifications active.');
+      } catch {
+        // Hardware firmware may transmit posture only
+      }
+
+      // Check for standard Bluetooth SIG Heart Rate Service (0x180D) if available
+      try {
+        const hrService = await this.server.getPrimaryService(HEART_RATE_SERVICE_UUID);
+        if (hrService) {
+          const hrChar = await hrService.getCharacteristic(CHARACTERISTIC_HR_UUID);
+          await hrChar.startNotifications();
+          hrChar.addEventListener('characteristicvaluechanged', (e: any) => {
+            try {
+              const view = e.target.value;
+              const flags = view.getUint8(0);
+              // Bit 0: 0 = 8-bit BPM, 1 = 16-bit BPM
+              const is16Bit = (flags & 0x01) !== 0;
+              const hr = is16Bit ? view.getUint16(1, true) : view.getUint8(1);
+              if (hr > 30 && hr < 220) {
+                const currentAngle = store.getState().posture.angle;
+                vitalsService.logTelemetry({
+                  heartRate: hr,
+                  spo2: store.getState().vitals.spo2 || 98,
+                  status: 'live',
+                  postureAngle: currentAngle,
+                  deviceId: this.device?.id || 'ble-hr-sensor'
+                });
+              }
+            } catch (hrErr) {
+              console.warn('Failed to parse standard BLE HR packet:', hrErr);
+            }
+          });
+          console.log('✅ Standard BLE Heart Rate service notifications active.');
+        }
+      } catch {
+        // Standard HR service not advertised, continue
+      }
+
+      // Successfully paired and connected
+      store.dispatch(setIsSimulating(false));
+      store.dispatch(setHasPaired(true));
+      store.dispatch(setDeviceStatus(true));
+      store.dispatch(updateVitals({ status: 'live' }));
+      ImuTelemetryFilter.reset(store.getState().posture.baselineAngle || 90);
+      console.log('✅ Bluetooth Low Energy connected and listening!');
+      return true;
+    } catch (error) {
+      console.error('Failed to establish GATT handshake:', error);
+      store.dispatch(setDeviceStatus(false));
+      return false;
+    }
+  }
+
+  /**
+   * Resilient parsing of BLE angle characteristic supporting:
+   * 1. 4-byte Float32 (Standard ESP32 C++ `float appAngle` little-endian)
+   * 2. 2-byte Signed/Unsigned int16_t (standard GATT little-endian)
+   * 3. 1-byte uint8_t
+   * 4. UTF-8 text string (e.g. "85.4" or JSON {"angle": 85})
+   */
+  public parseBleAngle(view: DataView): number | null {
+    if (!view || view.byteLength === 0) return null;
+
+    // A. Check for JSON / text string payload
+    try {
+      const text = new TextDecoder().decode(view).trim();
+      const jsonStart = text.indexOf('{');
+      const jsonEnd = text.lastIndexOf('}');
+      if (jsonStart !== -1 && jsonEnd > jsonStart) {
+        const obj = JSON.parse(text.substring(jsonStart, jsonEnd + 1));
+        if (typeof obj.angle === 'number') return obj.angle;
+        if (typeof obj.a === 'number') return obj.a;
+      }
+      const num = parseFloat(text);
+      if (!isNaN(num) && /^-?\d+(\.\d+)?$/.test(text)) {
+        if (num >= -180 && num <= 180) {
+          return Math.round(num * 10) / 10;
+        }
+      }
+    } catch {}
+
+    // B. 4-byte Float32 (Standard IEEE 754 float in C++ Arduino `sizeof(appAngle) == 4`)
+    if (view.byteLength === 4) {
+      const floatValLE = view.getFloat32(0, true);
+      if (!isNaN(floatValLE) && isFinite(floatValLE) && floatValLE >= -180 && floatValLE <= 180) {
+        return Math.round(floatValLE * 10) / 10;
+      }
+      const floatValBE = view.getFloat32(0, false);
+      if (!isNaN(floatValBE) && isFinite(floatValBE) && floatValBE >= -180 && floatValBE <= 180) {
+        return Math.round(floatValBE * 10) / 10;
+      }
+      // Or 4-byte int32
+      const int32LE = view.getInt32(0, true);
+      if (int32LE >= -180 && int32LE <= 180) {
+        return int32LE;
+      }
+    }
+
+    // C. 2-byte Signed or Unsigned Integer (int16_t on ESP32)
+    if (view.byteLength === 2) {
+      const int16LE = view.getInt16(0, true);
+      if (int16LE >= -180 && int16LE <= 180) {
+        return int16LE;
+      }
+      const uint16LE = view.getUint16(0, true);
+      if (uint16LE <= 180) {
+        return uint16LE;
+      }
+      const int16BE = view.getInt16(0, false);
+      if (int16BE >= -180 && int16BE <= 180) {
+        return int16BE;
+      }
+    }
+
+    // D. 1-byte Signed or Unsigned Integer (uint8 / int8)
+    if (view.byteLength === 1) {
+      const u8 = view.getUint8(0);
+      return u8 <= 180 ? u8 : view.getInt8(0);
+    }
+
+    // Fallback if buffer has at least 2 bytes
+    if (view.byteLength >= 2) {
+      return view.getInt16(0, true);
+    }
+
+    return null;
+  }
+
+  /**
+   * Resilient parsing of BLE battery characteristic supporting uint8, int16, float32, or text
+   */
+  public parseBleBattery(view: DataView): number | null {
+    if (!view || view.byteLength === 0) return null;
+
+    // A. Check for JSON / text string payload
+    try {
+      const text = new TextDecoder().decode(view).trim();
+      if (text.startsWith('{')) {
+        const obj = JSON.parse(text);
+        if (typeof obj.battery === 'number') return Math.min(100, Math.max(0, Math.round(obj.battery)));
+        if (typeof obj.batteryLevel === 'number') return Math.min(100, Math.max(0, Math.round(obj.batteryLevel)));
+        if (typeof obj.b === 'number') return Math.min(100, Math.max(0, Math.round(obj.b)));
+      }
+      const num = parseFloat(text);
+      if (!isNaN(num) && /^\d+(\.\d+)?$/.test(text)) {
+        return Math.min(100, Math.max(0, Math.round(num)));
+      }
+    } catch {}
+
+    // B. 1-byte uint8 (Standard BLE Battery Characteristic 0x2A19)
+    if (view.byteLength === 1) {
+      return Math.min(100, Math.max(0, view.getUint8(0)));
+    }
+
+    // C. 2-byte integer
+    if (view.byteLength === 2) {
+      const val = view.getInt16(0, true);
+      if (val >= 0 && val <= 100) return val;
+      return Math.min(100, Math.max(0, view.getUint8(0)));
+    }
+
+    // D. 4-byte Float32
+    if (view.byteLength === 4) {
+      const floatVal = view.getFloat32(0, true);
+      if (!isNaN(floatVal) && floatVal >= 0 && floatVal <= 100) {
+        return Math.min(100, Math.max(0, Math.round(floatVal)));
+      }
+    }
+
+    return Math.min(100, Math.max(0, view.getUint8(0)));
+  }
+
+  private handleAngleNotification = (event: Event) => {
+    const target = event.target as any;
+    if (!target || !target.value) return;
+
+    try {
+      const view = target.value; // DataView
+
+      // Check if this is a 6-axis JSON payload (from the ESP32 code: {"angle":88.4,"ax":0.02,"ay":0.98,"az":0.11,"gx":0.5,"gy":-0.2,"gz":0.1})
+      try {
+        const text = new TextDecoder().decode(view).trim();
+        const jsonStart = text.indexOf('{');
+        const jsonEnd = text.lastIndexOf('}');
+        if (jsonStart !== -1 && jsonEnd > jsonStart) {
+          const jsonStr = text.substring(jsonStart, jsonEnd + 1);
+          const obj = JSON.parse(jsonStr);
+          if (typeof obj.ax === 'number' && typeof obj.ay === 'number' && typeof obj.az === 'number') {
+            const gx = typeof obj.gx === 'number' ? obj.gx : 0;
+            const gy = typeof obj.gy === 'number' ? obj.gy : 0;
+            const gz = typeof obj.gz === 'number' ? obj.gz : 0;
+            const angleVal = typeof obj.angle === 'number' ? obj.angle : 90;
+            fallDetectionService.processSample(obj.ax, obj.ay, obj.az, gx, gy, gz, angleVal);
+          }
+        }
+      } catch {}
+
+      const rawAngle = this.parseBleAngle(view);
+      if (rawAngle !== null && !isNaN(rawAngle)) {
+        // Real-time Complementary / Madgwick filter rejects transient spikes & stabilizes telemetry
+        const filteredAngle = ImuTelemetryFilter.processSample(rawAngle);
+        store.dispatch(updateAngle(filteredAngle));
+        console.log(`📡 BLE Received Pitch: Raw=${rawAngle}°, Filtered=${filteredAngle}° (bytes: ${view.byteLength})`);
+
+        // If auto-recording is enabled, activate session on live telemetry
+        const state = store.getState();
+        if (state.posture.autoRecordEnabled && !state.posture.isRecordingSession) {
+          store.dispatch(setIsRecordingSession(true));
+        }
+      } else {
+        console.warn('Could not parse BLE angle packet:', view);
+      }
+    } catch (err) {
+      console.warn('Failed to parse angle packet:', err);
+    }
+  };
+
+  private handleBatteryNotification = (event: Event) => {
+    const target = event.target as any;
+    if (!target || !target.value) return;
+
+    try {
+      const view = target.value; // DataView
+      const battery = this.parseBleBattery(view);
+      if (battery !== null && !isNaN(battery)) {
+        store.dispatch(updateBattery(battery));
+        console.log('📡 BLE Received Battery Level:', battery, '%');
+      }
+    } catch (err) {
+      console.warn('Failed to parse battery packet:', err);
+    }
+  };
+
+  public async writeConfigPayload(payload: any): Promise<boolean> {
+    if (!this.configCharacteristic) {
+      console.warn('BLE Config Characteristic is not connected or available.');
+      return false;
+    }
+    try {
+      const encoder = new TextEncoder();
+      const data = encoder.encode(JSON.stringify(payload));
+      await this.configCharacteristic.writeValue(data);
+      console.log('✅ Synchronized configuration payload to ESP32 Flash Preferences:', payload);
+      return true;
+    } catch (err) {
+      console.error('Failed to write configuration updates to ESP32 over BLE:', err);
+      return false;
+    }
+  }
+
+  public async writeConfig(threshold: number, delayMs: number, baseline?: number): Promise<boolean> {
+    const payload: any = {
+      t: threshold,
+      d: delayMs
+    };
+    if (typeof baseline === 'number') {
+      payload.b = baseline;
+    }
+    return this.writeConfigPayload(payload);
+  }
+
+  public async triggerCalibration(): Promise<boolean> {
+    if (!this.configCharacteristic) {
+      console.warn('BLE Config Characteristic is not connected or available for calibration.');
+      return false;
+    }
+    try {
+      const payload = { c: 1 };
+      const encoder = new TextEncoder();
+      const data = encoder.encode(JSON.stringify(payload));
+      await this.configCharacteristic.writeValue(data);
+      ImuTelemetryFilter.reset(store.getState().posture.baselineAngle || 90);
+      console.log('✅ Sent physical calibration command ({"c":1}) to ESP32.');
+      return true;
+    } catch (err) {
+      console.error('Failed to write calibration command to ESP32 over BLE:', err);
+      return false;
+    }
+  }
+
+  private handleDisconnected = () => {
+    console.warn('⚠️ PosturePal BLE GATT disconnected!');
+    store.dispatch(setDeviceStatus(false));
+
+    // Attempt automatic reconnection if device was previously bonded
+    if (this.device) {
+      console.log('Triggering automatic background reconnection timer in 5 seconds...');
+      if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = setTimeout(() => {
+        this.reestablishGattConnectionSilently();
+      }, 5000);
+    }
+  };
+
+  private async reestablishGattConnectionSilently() {
+    if (!this.device) return;
+    console.log('Attempting silent GATT reconnection...');
+    try {
+      const success = await this.establishGattConnection();
+      if (success) {
+        console.log('✅ Background reconnection successful!');
+      } else {
+        // Schedule next retry
+        this.reconnectTimeout = setTimeout(() => this.reestablishGattConnectionSilently(), 8000);
+      }
+    } catch (e) {
+      this.reconnectTimeout = setTimeout(() => this.reestablishGattConnectionSilently(), 8000);
+    }
+  }
+
+  public disconnect() {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+
+    if (this.angleCharacteristic) {
+      this.angleCharacteristic.removeEventListener('characteristicvaluechanged', this.handleAngleNotification);
+      this.angleCharacteristic.stopNotifications().catch(() => {});
+      this.angleCharacteristic = null;
+    }
+
+    if (this.batteryCharacteristic) {
+      this.batteryCharacteristic.removeEventListener('characteristicvaluechanged', this.handleBatteryNotification);
+      this.batteryCharacteristic.stopNotifications().catch(() => {});
+      this.batteryCharacteristic = null;
+    }
+
+    this.configCharacteristic = null;
+
+    if (this.device) {
+      this.device.removeEventListener('gattserverdisconnected', this.handleDisconnected);
+    }
+
+    if (this.server && this.server.connected) {
+      this.server.disconnect();
+    }
+
+    this.server = null;
+    this.device = null;
+    store.dispatch(setDeviceStatus(false));
+    console.log('Disconnected from BLE Device.');
+  }
+}
+
+export const bluetoothService = new BluetoothService();
+
